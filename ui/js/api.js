@@ -8,7 +8,7 @@ export const api = {
   chooseExcel: () => invoke("choose_excel"),
   refreshNow: () => invoke("refresh_now"),
   openExcel: () => invoke("open_excel_file"),
-  testAlert: () => invoke("test_alert"),
+  testAlert: (serious = false) => invoke("test_alert", { serious }),
   getAlert: () => invoke("get_alert"),
   dismissAlert: () => invoke("dismiss_alert"),
   snoozeAlerts: (minutes) => invoke("snooze_alerts", { minutes }),

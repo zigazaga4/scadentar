@@ -5,13 +5,13 @@ import { URGENCY, dateRo, money, plural, when } from "./fmt.js";
 
 const root = document.getElementById("root");
 
-function section(urgency, groups) {
+function section(urgency, groups, title = null) {
   if (!groups.length) return null;
   const { label, cls } = URGENCY[urgency];
   return h(
     "div",
     {},
-    h("h3", { class: cls }, `${label} (${groups.length})`),
+    h("h3", { class: cls }, title ?? `${label} (${groups.length})`),
     groups.map((g) =>
       h(
         "div",
@@ -27,15 +27,30 @@ function section(urgency, groups) {
 function render(digest) {
   clear(root);
   const empty = !digest || !digest.groups.length;
+  const serious = !empty && digest.serious > 0;
+  const isSerious = (g) => g.critical && g.urgency === "overdue";
+  const others = empty ? [] : digest.groups.filter((g) => !isSerious(g));
+  document.title = serious ? "🚨 ATENȚIE — scadență depășită la un contract important" : "Scadențe de plată";
   root.append(
-    h("div", { class: `alert-head ${empty ? "calm" : ""}` }, h("h1", {}, empty ? "Nicio scadență acum" : "Scadențe de plată"), h("p", {}, empty ? "Totul este la zi." : `${digest.title} · ${digest.date}`)),
-    h("div", { class: "alert-body" }, empty ? null : ["overdue", "today", "soon"].map((u) => section(u, digest.groups.filter((g) => g.urgency === u)))),
+    h(
+      "div",
+      { class: `alert-head ${empty ? "calm" : ""} ${serious ? "serious" : ""}` },
+      h("h1", {}, empty ? "Nicio scadență acum" : serious ? "🚨 ATENȚIE — scadență depășită" : "Scadențe de plată"),
+      h("p", {}, empty ? "Totul este la zi." : serious ? `${plural(digest.serious, "factură depășită", "facturi depășite")} la contracte importante · ${digest.date}` : `${digest.title} · ${digest.date}`),
+    ),
+    h(
+      "div",
+      { class: "alert-body" },
+      serious && section("overdue", digest.groups.filter(isSerious), "🚨 Contracte importante — depășite"),
+      serious && h("p", { class: "serious-note" }, "Plătește cât mai repede. După plată, treci „Rest de plată” la 0 în Excel și alerta se oprește."),
+      ["overdue", "today", "soon"].map((u) => section(u, others.filter((g) => g.urgency === u), serious && u === "overdue" ? `Alte scadențe depășite (${others.filter((g) => g.urgency === u).length})` : null)),
+    ),
     h(
       "div",
       { class: "alert-foot" },
       h("button", { class: "btn primary", onclick: () => guarded(() => api.dismissAlert()) }, "Am văzut"),
       h("button", { class: "btn", onclick: () => guarded(() => api.snoozeAlerts(60)) }, "Amână 1 oră"),
-      h("button", { class: "btn", onclick: () => guarded(() => api.snoozeAlerts(240)) }, "Amână 4 ore"),
+      !serious && h("button", { class: "btn", onclick: () => guarded(() => api.snoozeAlerts(240)) }, "Amână 4 ore"),
       h("button", { class: "btn", onclick: async () => { await guarded(() => api.showMain()); } }, "Deschide aplicația"),
       h("div", { class: "grow" }),
       empty ? null : h("span", { class: "alert-total" }, `Total: ${money(digest.totalRest)}`),

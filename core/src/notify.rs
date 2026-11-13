@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveDateTime, Timelike};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Alertable, Group, Scadenta, Urgency};
@@ -48,7 +48,7 @@ pub fn classify(items: &[Scadenta], settings: &Settings, today: NaiveDate) -> Cl
             0 => Urgency::Today,
             _ => Urgency::Soon,
         };
-        let entry = Alertable { item: item.clone(), urgency, days };
+        let entry = Alertable { item: item.clone(), urgency, days, critical: settings.is_critical(&item.foaie) };
         if days > UPCOMING_DAYS {
             continue;
         } else if days > settings.warn_days as i64 {
@@ -82,6 +82,7 @@ pub fn group(alerts: &[Alertable]) -> Vec<Group> {
             count: 0,
             total_rest: 0.0,
             facturi: Vec::new(),
+            critical: a.critical,
         });
         g.count += 1;
         g.total_rest += a.item.rest;
@@ -99,6 +100,9 @@ pub struct NotifyState {
     pub notified: HashMap<String, Seen>,
     /// Până la ce moment (secunde Unix) alertele sunt amânate de utilizator.
     pub snoozed_until: i64,
+    /// Modul `times`: ultima oră fixă de alertă deja tratată, ca marcaj de timp al orei locale
+    /// (vezi [`slot_stamp`]). 0 = niciuna încă.
+    pub last_slot: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -134,10 +138,32 @@ pub fn should_notify(alerts: &[Alertable], state: &NotifyState, now: i64, hour: 
         None => true,
         Some(seen) if seen.level < a.urgency.level() => true,
         Some(seen) => {
-            let hours = if a.urgency == Urgency::Soon { SOON_REPEAT_HOURS } else { settings.repeat_hours };
+            let hours = if a.is_serious() {
+                settings.critical_repeat_hours
+            } else if a.urgency == Urgency::Soon {
+                SOON_REPEAT_HOURS
+            } else {
+                settings.repeat_hours
+            };
             now - seen.at >= i64::from(hours) * 3600
         }
     })
+}
+
+/// Marcaj de timp pentru o dată și oră locală (ora de pe ceas, fără fus orar): doar pentru comparații.
+pub fn slot_stamp(local: NaiveDateTime) -> i64 {
+    local.and_utc().timestamp()
+}
+
+/// Modul `times`: a venit vremea unei ore fixe de alertă netratate încă? Întoarce marcajul orei
+/// (de salvat în [`NotifyState::last_slot`] după ce a fost tratată). Contează doar orele de azi; dacă
+/// calculatorul a fost oprit la ora respectivă, alerta vine la prima verificare de după.
+pub fn due_slot(times: &[u32], last_slot: i64, now: NaiveDateTime) -> Option<i64> {
+    let minute_now = now.hour() * 60 + now.minute();
+    let latest = times.iter().copied().filter(|&m| m <= minute_now).max()?;
+    let slot = now.date().and_hms_opt(latest / 60, latest % 60, 0)?;
+    let stamp = slot_stamp(slot);
+    (stamp > last_slot).then_some(stamp)
 }
 
 /// Notează că toate facturile din `alerts` au fost comunicate acum; le uită pe cele care nu mai sunt de actualitate.
@@ -303,5 +329,70 @@ mod tests {
         // rest diferit (plată parțială) = factură „nouă”
         let partial = classify(&[item("A", "x", today(), 40.0)], &settings, today()).alerts;
         assert!(should_notify(&partial, &state, 20, 9, &settings));
+    }
+
+    #[test]
+    fn critical_sheets_flag_their_items_and_overdue_ones_are_serious() {
+        let settings = Settings { critical_sheets: vec!["Leasing".into()], ..Default::default() };
+        let items = vec![
+            item("Leasing", "rata-veche", d(2026, 11, 10), 700.0),
+            item("Leasing", "rata-azi", today(), 700.0),
+            item("Service", "factura-veche", d(2026, 11, 10), 90.0),
+        ];
+        let alerts = classify(&items, &settings, today()).alerts;
+        let serious: Vec<_> = alerts.iter().filter(|a| a.is_serious()).map(|a| a.item.factura.as_str()).collect();
+        assert_eq!(serious, ["rata-veche"]);
+        assert!(alerts.iter().any(|a| a.critical && a.urgency == Urgency::Today && !a.is_serious()));
+        let groups = group(&alerts);
+        assert!(groups.iter().any(|g| g.is_serious() && g.foaie == "Leasing"));
+        assert!(!groups.iter().any(|g| g.is_serious() && g.foaie == "Service"));
+    }
+
+    #[test]
+    fn serious_alerts_repeat_faster_than_normal_ones() {
+        let settings = Settings { critical_sheets: vec!["Leasing".into()], ..Default::default() }; // normal 4 h, serios 2 h
+        let serious = classify(&[item("Leasing", "r", d(2026, 11, 10), 700.0)], &settings, today()).alerts;
+        let normal = classify(&[item("Service", "f", d(2026, 11, 10), 700.0)], &settings, today()).alerts;
+        let (mut s_state, mut n_state) = (NotifyState::default(), NotifyState::default());
+        mark_notified(&serious, &mut s_state, 0);
+        mark_notified(&normal, &mut n_state, 0);
+        assert!(!should_notify(&serious, &s_state, 2 * 3600 - 1, 12, &settings));
+        assert!(should_notify(&serious, &s_state, 2 * 3600, 12, &settings), "serios: după 2 ore");
+        assert!(!should_notify(&normal, &n_state, 2 * 3600, 12, &settings), "normal: încă nu");
+        assert!(should_notify(&normal, &n_state, 4 * 3600, 12, &settings));
+    }
+
+    fn at(h: u32, m: u32) -> NaiveDateTime {
+        today().and_hms_opt(h, m, 0).unwrap()
+    }
+
+    #[test]
+    fn fixed_times_fire_once_per_slot() {
+        let times = [9 * 60, 15 * 60];
+        assert_eq!(due_slot(&times, 0, at(8, 59)), None, "înainte de prima oră");
+        let nine = due_slot(&times, 0, at(9, 0)).expect("la 09:00");
+        assert_eq!(due_slot(&times, nine, at(9, 30)), None, "ora a fost deja tratată");
+        assert_eq!(due_slot(&times, nine, at(14, 59)), None);
+        let three = due_slot(&times, nine, at(15, 0)).expect("la 15:00");
+        assert!(three > nine);
+        assert_eq!(due_slot(&times, three, at(23, 59)), None, "nimic până a doua zi");
+    }
+
+    #[test]
+    fn a_missed_slot_is_caught_up_once_when_the_app_starts_late() {
+        let times = [9 * 60, 15 * 60];
+        // calculatorul pornește la 17:00; ambele ore au trecut, dar se face o singură alertă (cea mai recentă)
+        let slot = due_slot(&times, 0, at(17, 0)).expect("recuperare");
+        assert_eq!(slot, slot_stamp(at(15, 0)));
+        assert_eq!(due_slot(&times, slot, at(17, 1)), None);
+    }
+
+    #[test]
+    fn changing_the_schedule_resets_the_bookkeeping() {
+        // în aplicație, la schimbarea orelor `last_slot` devine „acum”: orele de până atunci nu se mai alertează
+        let times = [9 * 60];
+        let now = at(11, 0);
+        assert_eq!(due_slot(&times, slot_stamp(now), now), None);
+        assert!(due_slot(&times, slot_stamp(now), today().succ_opt().unwrap().and_hms_opt(9, 0, 0).unwrap()).is_some(), "a doua zi la 09:00");
     }
 }

@@ -4,7 +4,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use chrono::{Local, Timelike};
-use scadentar_core::notify::{mark_notified, should_notify};
+use scadentar_core::notify::{due_slot, mark_notified, should_notify};
+use scadentar_core::settings::AlertMode;
 use scadentar_core::{read_workbook, Loaded, Settings, Snapshot};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -115,7 +116,7 @@ fn read_file(path: &str) -> Result<(Loaded, Option<std::time::SystemTime>), Stri
     Ok((loaded, mtime))
 }
 
-/// Dă alarma dacă sunt scadențe noi, mai urgente sau a venit vremea unei reamintiri.
+/// Dă alarma când a venit vremea ei: la interval (scadențe noi, mai urgente sau reamintiri) sau la ora fixă aleasă.
 async fn maybe_alert(app: &AppHandle) {
     let state = app.state::<AppState>();
     let settings = state.settings.lock().unwrap().clone();
@@ -123,8 +124,26 @@ async fn maybe_alert(app: &AppHandle) {
     let now = Local::now();
 
     let due = {
-        let notify = state.notify.lock().unwrap();
-        should_notify(&snapshot.alerts, &notify, now.timestamp(), now.hour(), &settings)
+        let mut notify = state.notify.lock().unwrap();
+        match settings.alert_mode {
+            AlertMode::Interval => should_notify(&snapshot.alerts, &notify, now.timestamp(), now.hour(), &settings),
+            AlertMode::Times => {
+                // O oră fixă a sosit. Amânarea utilizatorului așteaptă (alerta vine după ea); altfel ora se
+                // socotește tratată chiar dacă nu e nimic de spus, ca ceva apărut mai târziu să aștepte ora următoare.
+                match due_slot(&settings.alert_minutes(), notify.last_slot, now.naive_local()) {
+                    Some(slot) if now.timestamp() >= notify.snoozed_until => {
+                        notify.last_slot = slot;
+                        if snapshot.alerts.is_empty() {
+                            if let Err(e) = persist::save_json(&state.notify_path(), &*notify) {
+                                log::warn!("Nu pot salva starea alertelor: {e}");
+                            }
+                        }
+                        !snapshot.alerts.is_empty()
+                    }
+                    _ => false,
+                }
+            }
+        }
     };
     if !due {
         return;

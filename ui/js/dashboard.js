@@ -7,6 +7,21 @@ const view = { text: "", showUpcoming: false };
 
 const baseName = (path) => (path ?? "").split(/[\\/]/).pop();
 
+/** Depășită la un contract important (alertă serioasă). */
+export const isSerious = (item) => item.critical && item.urgency === "overdue";
+
+function seriousBanner(alerts) {
+  const serious = alerts.filter(isSerious);
+  if (!serious.length) return null;
+  const sheets = [...new Set(serious.map((a) => a.foaie))];
+  return h(
+    "div",
+    { class: "banner serious" },
+    h("strong", {}, `🚨 ATENȚIE — ${plural(serious.length, "scadență depășită", "scadențe depășite")} la contracte importante`),
+    h("div", {}, `${sheets.join(", ")} · ${money(sum(serious, (i) => i.rest))} de plătit. După plată, treci „Rest de plată” la 0 în Excel.`),
+  );
+}
+
 function statCard(urgency, items) {
   const { label, cls } = URGENCY[urgency];
   return h(
@@ -20,12 +35,13 @@ function statCard(urgency, items) {
 
 function row(item, upcoming = false) {
   const kind = upcoming ? "upcoming" : item.urgency;
+  const serious = !upcoming && isSerious(item);
   return h(
     "tr",
-    { class: kind },
+    { class: `${kind} ${serious ? "serious" : ""}` },
     h("td", {}, dateRo(item.scadenta)),
     h("td", {}, h("span", { class: `badge ${kind}` }, when(item.days))),
-    h("td", {}, item.foaie),
+    h("td", {}, item.critical && h("span", { class: "star", title: "Contract important" }, "★ "), item.foaie),
     h("td", {}, item.factura || h("span", { class: "muted" }, "—")),
     h("td", { class: "num" }, money(item.rest)),
     h("td", { class: "num muted" }, money(item.suma)),
@@ -72,6 +88,8 @@ export function renderDashboard(root, { settings, snapshot }, actions) {
 
   const page = h("div", { class: "page" });
   if (snapshot.error) page.append(h("div", { class: "banner" }, snapshot.error));
+  const serious = seriousBanner(alerts);
+  if (serious) page.append(serious);
 
   page.append(
     h(

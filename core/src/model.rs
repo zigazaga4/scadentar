@@ -46,6 +46,16 @@ pub struct Alertable {
     pub urgency: Urgency,
     /// Zile până la scadență: negativ = depășită cu atâtea zile.
     pub days: i64,
+    /// Foaia e un contract important ales de utilizator (ex. leasing de mașină).
+    #[serde(default)]
+    pub critical: bool,
+}
+
+impl Alertable {
+    /// Alertă serioasă: scadență depășită la un contract important.
+    pub fn is_serious(&self) -> bool {
+        self.critical && self.urgency == Urgency::Overdue
+    }
 }
 
 /// Facturile aceluiași furnizor cu aceeași dată scadentă (ex. 10 rate de leasing în aceeași zi).
@@ -59,4 +69,14 @@ pub struct Group {
     pub count: usize,
     pub total_rest: f64,
     pub facturi: Vec<String>,
+    /// Contract important (vezi [`Alertable::critical`]).
+    #[serde(default)]
+    pub critical: bool,
+}
+
+impl Group {
+    /// Depășită la un contract important.
+    pub fn is_serious(&self) -> bool {
+        self.critical && self.urgency == Urgency::Overdue
+    }
 }

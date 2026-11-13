@@ -61,6 +61,8 @@ pub fn when(days: i64) -> String {
 pub struct Digest {
     /// Ex.: „3 scadențe depășite · 2 azi · 5 în curând”.
     pub title: String,
+    /// Titlul notificării Windows; la o alertă serioasă începe cu 🚨 și spune despre ce e vorba.
+    pub headline: String,
     /// Textul scurt pentru notificarea Windows.
     pub toast: String,
     /// Mesajul complet pentru WhatsApp.
@@ -69,6 +71,8 @@ pub struct Digest {
     pub overdue: usize,
     pub today: usize,
     pub soon: usize,
+    /// Câte facturi sunt depășite la contracte importante (alertă serioasă dacă > 0).
+    pub serious: usize,
     pub total_rest: f64,
     /// Când a fost generată: `13.11.2026`.
     pub date: String,
@@ -84,32 +88,49 @@ impl Digest {
 const TOAST_LINES: usize = 3;
 const WHATSAPP_LINES: usize = 40;
 
-pub fn build_digest(alerts: &[Alertable], today: NaiveDate) -> Digest {
+/// Ex.: „2 scadențe depășite · 1 azi · 3 în curând” (părțile goale lipsesc).
+fn summary(alerts: &[&Alertable]) -> String {
     let count = |u: Urgency| alerts.iter().filter(|a| a.urgency == u).count();
-    let (overdue, due_today, soon) = (count(Urgency::Overdue), count(Urgency::Today), count(Urgency::Soon));
-    let groups = group(alerts);
-    let total_rest = alerts.iter().map(|a| a.item.rest).sum();
-
+    let (overdue, today, soon) = (count(Urgency::Overdue), count(Urgency::Today), count(Urgency::Soon));
     let mut parts = Vec::new();
     if overdue > 0 {
-        parts.push(format!("{} depășite", plural(overdue, "scadență", "scadențe")));
+        parts.push(plural(overdue, "scadență depășită", "scadențe depășite"));
     }
-    if due_today > 0 {
-        parts.push(format!("{due_today} azi"));
+    if today > 0 {
+        parts.push(format!("{today} azi"));
     }
     if soon > 0 {
         parts.push(format!("{soon} în curând"));
     }
-    let title = parts.join(" · ");
+    parts.join(" · ")
+}
+
+pub fn build_digest(alerts: &[Alertable], today: NaiveDate) -> Digest {
+    let count = |u: Urgency| alerts.iter().filter(|a| a.urgency == u).count();
+    let (overdue, due_today, soon) = (count(Urgency::Overdue), count(Urgency::Today), count(Urgency::Soon));
+    let serious = alerts.iter().filter(|a| a.is_serious()).count();
+    let groups = group(alerts);
+    let total_rest = alerts.iter().map(|a| a.item.rest).sum();
+
+    let all: Vec<&Alertable> = alerts.iter().collect();
+    let others: Vec<&Alertable> = alerts.iter().filter(|a| !a.is_serious()).collect();
+    let title = summary(&all);
+    let headline = if serious > 0 {
+        format!("🚨 ATENȚIE — {} la contracte importante", plural(serious, "scadență depășită", "scadențe depășite"))
+    } else {
+        format!("Scadențe de plată: {title}")
+    };
 
     Digest {
         toast: toast_text(&groups, today),
-        whatsapp: whatsapp_text(&groups, today, &title, total_rest),
+        whatsapp: whatsapp_text(&groups, today, &summary(&others), total_rest),
+        headline,
         title,
         groups,
         overdue,
         today: due_today,
         soon,
+        serious,
         total_rest,
         date: date_ro(today),
     }
@@ -120,29 +141,55 @@ fn line(g: &Group, today: NaiveDate) -> String {
     format!("{} — {} {} — {}{}", g.foaie, date_short(g.scadenta, today), when(g.days), money(g.total_rest), what)
 }
 
+/// Grupele cu cele serioase în față (ordinea dintre ele rămâne cea cronologică).
+fn serious_first(groups: &[Group]) -> Vec<&Group> {
+    let (mut first, rest): (Vec<&Group>, Vec<&Group>) = groups.iter().partition(|g| g.is_serious());
+    first.extend(rest);
+    first
+}
+
 fn toast_text(groups: &[Group], today: NaiveDate) -> String {
-    let mut lines: Vec<String> = groups.iter().take(TOAST_LINES).map(|g| line(g, today)).collect();
+    let mut lines: Vec<String> = serious_first(groups).into_iter().take(TOAST_LINES).map(|g| line(g, today)).collect();
     if groups.len() > TOAST_LINES {
         lines.push(format!("…și încă {}", plural(groups.len() - TOAST_LINES, "furnizor/dată", "furnizori/date")));
     }
     lines.join("\n")
 }
 
-fn whatsapp_text(groups: &[Group], today: NaiveDate, title: &str, total_rest: f64) -> String {
-    let mut out = format!("⚠️ *Scadențe plăți* — {}\n{}\n", date_ro(today), title);
+/// Mesajul WhatsApp. Dacă există scadențe depășite la contracte importante, ele deschid mesajul
+/// într-un bloc de avertizare, iar restul vine dedesubt. `others_title` rezumă doar restul.
+fn whatsapp_text(groups: &[Group], today: NaiveDate, others_title: &str, total_rest: f64) -> String {
+    let (serious, others): (Vec<&Group>, Vec<&Group>) = groups.iter().partition(|g| g.is_serious());
+    let mut out = String::new();
     let mut shown = 0;
-    for (urgency, heading) in [(Urgency::Overdue, "🔴 *DEPĂȘITE*"), (Urgency::Today, "🟠 *AZI*"), (Urgency::Soon, "🟡 *ÎN CURÂND*")] {
-        let section: Vec<&Group> = groups.iter().filter(|g| g.urgency == urgency).collect();
-        if section.is_empty() {
-            continue;
-        }
-        out.push_str(&format!("\n{heading}\n"));
-        for g in section {
-            if shown == WHATSAPP_LINES {
-                break;
-            }
-            out.push_str(&format!("• {}\n", line(g, today)));
+
+    if !serious.is_empty() {
+        out.push_str(&format!("🚨🚨🚨 *ATENȚIE — SCADENȚĂ DEPĂȘITĂ LA UN CONTRACT IMPORTANT* 🚨🚨🚨\n{}\n\n", date_ro(today)));
+        for g in &serious {
+            out.push_str(&format!("🚨 {}\n", line(g, today)));
             shown += 1;
+        }
+        out.push_str("\n*Plătește cât mai repede.* După plată treci „Rest de plată” la 0 în Excel și alerta se oprește.\n");
+        if !others.is_empty() {
+            out.push_str("\n──────────\n");
+        }
+    }
+
+    if !others.is_empty() {
+        out.push_str(&format!("⚠️ *Scadențe plăți* — {}\n{}\n", date_ro(today), others_title));
+        for (urgency, heading) in [(Urgency::Overdue, "🔴 *DEPĂȘITE*"), (Urgency::Today, "🟠 *AZI*"), (Urgency::Soon, "🟡 *ÎN CURÂND*")] {
+            let section: Vec<&&Group> = others.iter().filter(|g| g.urgency == urgency).collect();
+            if section.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("\n{heading}\n"));
+            for g in section {
+                if shown == WHATSAPP_LINES {
+                    break;
+                }
+                out.push_str(&format!("• {}\n", line(g, today)));
+                shown += 1;
+            }
         }
     }
     if groups.len() > shown {
@@ -219,5 +266,42 @@ mod tests {
         let digest = build_digest(&alerts, today);
         assert!(digest.whatsapp.contains("…și încă 20 linii"));
         assert!(digest.toast.contains("…și încă 57 furnizori/date"));
+    }
+
+    #[test]
+    fn overdue_important_contracts_make_a_serious_digest() {
+        let today = d(2026, 11, 13);
+        let settings = Settings { critical_sheets: vec!["Leasing Auto".into()], ..Default::default() };
+        let items = vec![
+            item("Leasing Auto", "rata 7", d(2026, 11, 10), 1500.0),
+            item("Leasing Auto", "rata 8", d(2026, 11, 10), 1500.0),
+            item("Service", "F1", d(2026, 11, 12), 200.0),
+            item("Asigurări", "RCA", d(2026, 11, 16), 300.0),
+        ];
+        let digest = build_digest(&classify(&items, &settings, today).alerts, today);
+        assert_eq!(digest.serious, 2);
+        assert!(digest.headline.starts_with("🚨 ATENȚIE — 2 scadențe depășite la contracte importante"), "{}", digest.headline);
+        // blocul de avertizare vine primul, restul dedesubt
+        let w = &digest.whatsapp;
+        assert!(w.starts_with("🚨🚨🚨 *ATENȚIE"), "{w}");
+        assert!(w.contains("🚨 Leasing Auto — 10.11 depășită cu 3 zile — 3.000,00 (2 facturi)"));
+        assert!(w.find("Plătește cât mai repede").unwrap() < w.find("Scadențe plăți").unwrap());
+        // restul nu repetă ratele din bloc și are propriul rezumat
+        assert!(w.contains("1 scadență depășită · 1 în curând"), "{w}");
+        assert!(!w.contains("• Leasing Auto"));
+        assert!(w.ends_with("Total de plată: *3.500,00*"));
+        // în notificarea scurtă, linia serioasă e prima
+        assert!(digest.toast.lines().next().unwrap().starts_with("Leasing Auto"));
+    }
+
+    #[test]
+    fn important_contracts_that_are_not_overdue_do_not_raise_the_alarm() {
+        let today = d(2026, 11, 13);
+        let settings = Settings { critical_sheets: vec!["Leasing Auto".into()], ..Default::default() };
+        let items = vec![item("Leasing Auto", "rata", d(2026, 11, 15), 1500.0), item("Leasing Auto", "rata azi", today, 1500.0)];
+        let digest = build_digest(&classify(&items, &settings, today).alerts, today);
+        assert_eq!(digest.serious, 0);
+        assert!(digest.headline.starts_with("Scadențe de plată:"));
+        assert!(!digest.whatsapp.contains("🚨"));
     }
 }

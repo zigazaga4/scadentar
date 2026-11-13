@@ -29,10 +29,11 @@ impl Channels {
 pub async fn fire(app: &AppHandle, digest: &Digest, channels: &Channels, whatsapp_prefix: Option<&str>) {
     let state = app.state::<AppState>();
     *state.digest.lock().unwrap() = Some(digest.clone());
-    log::info!("Alertă: {} ({} linii), căi: {channels:?}", digest.title, digest.groups.len());
+    let serious = digest.serious > 0;
+    log::info!("Alertă{}: {} ({} linii), căi: {channels:?}", if serious { " SERIOASĂ" } else { "" }, digest.title, digest.groups.len());
 
     if channels.toast {
-        let shown = app.notification().builder().title(format!("Scadențe de plată: {}", digest.title)).body(&digest.toast).show();
+        let shown = app.notification().builder().title(&digest.headline).body(&digest.toast).show();
         if let Err(e) = shown {
             log::warn!("Notificarea Windows nu a putut fi afișată: {e}");
         }
@@ -41,7 +42,7 @@ pub async fn fire(app: &AppHandle, digest: &Digest, channels: &Channels, whatsap
         show_popup(app, digest);
     }
     if channels.sound {
-        sound::alarm();
+        sound::alarm(serious);
     }
     if channels.whatsapp {
         send_whatsapp(app, digest, whatsapp_prefix).await;

@@ -2,7 +2,7 @@
 
 use chrono::Local;
 use scadentar_core::format::{build_digest, Digest};
-use scadentar_core::notify::snooze;
+use scadentar_core::notify::{slot_stamp, snooze};
 use scadentar_core::{Alertable, Scadenta, Settings, Snapshot, Urgency};
 use scadentar_wa::WaStatus;
 use serde::Serialize;
@@ -76,10 +76,21 @@ pub fn get_state(app: AppHandle) -> Boot {
 #[tauri::command]
 pub async fn save_settings(app: AppHandle, settings: Settings) -> CmdResult<Boot> {
     let settings = settings.sanitized();
+    let mut schedule_changed = false;
     update_settings(&app, |current| {
+        schedule_changed = current.alert_mode != settings.alert_mode || current.alert_times != settings.alert_times;
         let wa_paired = current.wa_paired; // starea legăturii cu WhatsApp o ține aplicația, nu interfața
         *current = Settings { wa_paired, ..settings.clone() };
     });
+    if schedule_changed {
+        // Orele de dinainte de schimbare nu mai contează: prima alertă vine la prima oră fixă care urmează.
+        let state = app.state::<AppState>();
+        let mut notify = state.notify.lock().unwrap();
+        notify.last_slot = slot_stamp(Local::now().naive_local());
+        if let Err(e) = persist::save_json(&state.notify_path(), &*notify) {
+            log::warn!("Nu pot salva starea alertelor: {e}");
+        }
+    }
     apply_autostart(&app, settings.autostart);
     engine::refresh(&app, false).await;
     Ok(boot(&app))
@@ -126,20 +137,29 @@ pub fn open_excel_file(app: AppHandle) -> CmdResult<()> {
     cmd.arg(&path).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// Declanșează o alertă de probă pe toate căile pornite (cu datele reale, sau cu un exemplu dacă nu e nimic scadent).
+/// Declanșează o alertă de probă pe toate căile pornite. Normală: datele reale (sau un exemplu, dacă nu e
+/// nimic scadent). Serioasă (`serious`): datele reale dacă au o scadență depășită la un contract important,
+/// altfel un exemplu, ca să vezi cum arată.
 #[tauri::command]
-pub async fn test_alert(app: AppHandle) -> CmdResult<()> {
+pub async fn test_alert(app: AppHandle, serious: bool) -> CmdResult<()> {
     let state = app.state::<AppState>();
     let settings = state.settings.lock().unwrap().clone();
     let snapshot = state.snapshot.lock().unwrap().clone();
-    let digest = if snapshot.digest.is_empty() { sample_digest() } else { snapshot.digest };
-    alert::fire(&app, &digest, &Channels::from_settings(&settings), Some("🔔 *Test Scadențar* — așa arată o alertă")).await;
+    let (digest, label) = if serious {
+        let digest = if snapshot.digest.serious > 0 { snapshot.digest } else { sample_digest(true) };
+        (digest, "🔔 *Test Scadențar* — așa arată o alertă SERIOASĂ")
+    } else {
+        let digest = if snapshot.digest.is_empty() { sample_digest(false) } else { snapshot.digest };
+        (digest, "🔔 *Test Scadențar* — așa arată o alertă")
+    };
+    alert::fire(&app, &digest, &Channels::from_settings(&settings), Some(label)).await;
     Ok(())
 }
 
-fn sample_digest() -> Digest {
+/// Alertă de exemplu; cu `serious` conține și o rată depășită la un contract important.
+fn sample_digest(serious: bool) -> Digest {
     let today = Local::now().date_naive();
-    let make = |foaie: &str, factura: &str, days: i64, rest: f64| {
+    let make = |foaie: &str, factura: &str, days: i64, rest: f64, critical: bool| {
         let urgency = match days {
             d if d < 0 => Urgency::Overdue,
             0 => Urgency::Today,
@@ -149,9 +169,12 @@ fn sample_digest() -> Digest {
             item: Scadenta { foaie: foaie.into(), factura: factura.into(), emisa: None, scadenta: today + chrono::Duration::days(days), suma: rest, rest, rand: 1 },
             urgency,
             days,
+            critical,
         }
     };
-    build_digest(&[make("Exemplu Leasing", "Rata 11", -2, 2450.0), make("Exemplu Service", "FF 1042", 0, 830.5), make("Exemplu Asigurări", "RCA", 5, 1999.0)], today)
+    let mut items = vec![make("Exemplu Service", "FF 1042", 0, 830.5, false), make("Exemplu Asigurări", "RCA", 5, 1999.0, false)];
+    items.push(if serious { make("Exemplu Leasing Mașină", "Rata 11", -2, 2450.0, true) } else { make("Exemplu Leasing", "Rata 11", -2, 2450.0, false) });
+    build_digest(&items, today)
 }
 
 /// Ultima alertă, pentru fereastra pop-up.
