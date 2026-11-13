@@ -1,0 +1,12 @@
+[package]
+name = "scadentar-core"
+version = "0.1.0"
+description = "Citirea facturilor din Excel și regulile de scadență"
+edition = "2021"
+
+[dependencies]
+calamine = "0.38"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

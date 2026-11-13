@@ -1,0 +1,11 @@
+/target
+node_modules
+src-tauri/gen
+.DS_Store
+# date private: registrele Excel și sesiunile WhatsApp nu se publică
+*.xls
+*.xlsx
+*.xlsm
+*.db
+*.db-wal
+*.db-shm
